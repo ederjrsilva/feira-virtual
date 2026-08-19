@@ -45,6 +45,7 @@ require('dotenv').config();
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const crypto = require('crypto');
+const funcionariosIA = require('./funcionarios');
 
 // O Render (e a maioria dos PaaS) atribui a porta dinamicamente via a variável
 // de ambiente PORT — o servidor PRECISA escutar nela em produção. Localmente,
@@ -67,6 +68,52 @@ const INTERVALO_MIN_BROADCAST_MOVE_MS = Number(process.env.INTERVALO_MIN_BROADCA
  * jogadorState = { ws, usuarioId, nome, tileX, tileY, direcao, avatarConfig, _ultimoBroadcastMove }
  */
 const salasPorCenario = new Map();
+
+/**
+ * funcionariosPorSala: Map<cenarioId, Map<instanciaId, Map<funcionarioId, npcState>>>
+ * Cada instância do cenário ganha sua PRÓPRIA cópia dos funcionários-IA
+ * daquele cenário (mesma lógica das instâncias de jogadores) — assim quem
+ * está na instância #2 vê os mesmos funcionários que quem está na #1, sem
+ * competirem pelo mesmo estado.
+ */
+const funcionariosPorSala = new Map();
+
+/** Cria as entidades de funcionário-IA de uma instância recém-aberta, a partir do catálogo (ver funcionarios.js). */
+function garantirFuncionariosDaInstancia(cenarioId, instanciaId) {
+  const listaCatalogo = funcionariosIA.getCatalogo().funcionariosPorCenario.get(cenarioId);
+  if (!listaCatalogo || !listaCatalogo.length) return;
+
+  if (!funcionariosPorSala.has(cenarioId)) funcionariosPorSala.set(cenarioId, new Map());
+  const porInstancia = funcionariosPorSala.get(cenarioId);
+  if (porInstancia.has(instanciaId)) return; // já foi criado
+
+  const npcs = new Map();
+  listaCatalogo.forEach((f) => {
+    const centroX = f.stand_pos_x + f.largura_tiles / 2;
+    const centroY = f.stand_pos_y + f.altura_tiles + 0.5; // nasce logo à frente do próprio stand
+    npcs.set(f.id, {
+      id: f.id,
+      lojaId: f.loja_id,
+      nome: f.nome,
+      corLoja: f.cor_loja,
+      avatarConfig: f.avatar_config,
+      tileX: Math.round(centroX),
+      tileY: Math.round(centroY),
+      direcao: 'baixo',
+      standCentroX: centroX,
+      standCentroY: centroY,
+      raioPatrulha: f.raio_patrulha,
+      raioAbordagem: f.raio_abordagem,
+      estado: 'patrulhando', // 'patrulhando' | 'abordando' | 'aguardando'
+      alvoUsuarioId: null,
+      waypointX: null,
+      waypointY: null,
+      cooldownAte: 0,
+      falandoAgora: false,
+    });
+  });
+  porInstancia.set(instanciaId, npcs);
+}
 
 /** Acha a instância em que um usuário JÁ está dentro de um cenário (ex: deu F5 na aba), se houver. */
 function encontrarInstanciaDoUsuario(cenarioId, usuarioId) {
@@ -91,6 +138,7 @@ function obterInstanciaComVaga(cenarioId) {
   const novaInstanciaId = instancias.size + 1;
   const novaSala = new Map();
   instancias.set(novaInstanciaId, novaSala);
+  garantirFuncionariosDaInstancia(cenarioId, novaInstanciaId);
   console.log(`[realtime-server] Cenário ${cenarioId} lotado — abrindo instância #${novaInstanciaId}.`);
   return { instanciaId: novaInstanciaId, sala: novaSala };
 }
@@ -101,7 +149,11 @@ function removerInstanciaSeVazia(cenarioId, instanciaId) {
   const sala = instancias.get(instanciaId);
   if (sala && sala.size === 0) {
     instancias.delete(instanciaId);
-    if (instancias.size === 0) salasPorCenario.delete(cenarioId);
+    funcionariosPorSala.get(cenarioId)?.delete(instanciaId); // libera a memória dos NPCs dessa instância também
+    if (instancias.size === 0) {
+      salasPorCenario.delete(cenarioId);
+      funcionariosPorSala.delete(cenarioId);
+    }
   }
 }
 
@@ -156,6 +208,153 @@ function difundirParaInstancia(cenarioId, instanciaId, tipo, dados, ignorarUsuar
   }
 }
 
+// =======================================================================
+// IA dos funcionários (patrulhar / abordar / falar)
+// =======================================================================
+
+function distanciaEuclidiana(x1, y1, x2, y2) {
+  return Math.hypot(x1 - x2, y1 - y2);
+}
+
+/** Dá um passo de tile na direção de um destino, evitando tiles bloqueados. Retorna null se não conseguiu se mover (cercado). */
+function escolherPassoEmDirecao(bloqueados, limites, origemX, origemY, destinoX, destinoY) {
+  const dx = Math.sign(destinoX - origemX);
+  const dy = Math.sign(destinoY - origemY);
+  if (dx === 0 && dy === 0) return null;
+
+  // Tenta primeiro o eixo com maior distância a percorrer, depois o outro —
+  // dá um movimento diagonal "serrilhado" razoável sem pathfinding de verdade.
+  const tentativas = Math.abs(destinoX - origemX) >= Math.abs(destinoY - origemY)
+    ? [[dx, 0], [0, dy]]
+    : [[0, dy], [dx, 0]];
+
+  for (const [px, py] of tentativas) {
+    if (px === 0 && py === 0) continue;
+    const novoX = origemX + px;
+    const novoY = origemY + py;
+    if (funcionariosIA.tileLivre(bloqueados, limites, novoX, novoY)) {
+      const direcao = py < 0 ? 'cima' : py > 0 ? 'baixo' : (px < 0 ? 'esquerda' : 'direita');
+      return { x: novoX, y: novoY, direcao };
+    }
+  }
+  return null; // cercado — fica parado neste tick
+}
+
+const [COOLDOWN_MIN_MS, COOLDOWN_MAX_MS] = funcionariosIA.COOLDOWN_ABORDAGEM_MS;
+
+/** Atualiza o estado (FSM) de UM funcionário-IA por um tick. Muta o objeto npc diretamente. */
+function tickFuncionario(npc, cenarioId, instanciaId, bloqueados, limites, salaJogadores) {
+  const agora = Date.now();
+
+  if (npc.estado === 'aguardando') {
+    if (agora >= npc.cooldownAte) npc.estado = 'patrulhando';
+    return;
+  }
+
+  if (npc.estado === 'abordando') {
+    const alvo = salaJogadores.get(npc.alvoUsuarioId);
+    if (!alvo) {
+      npc.estado = 'patrulhando';
+      npc.alvoUsuarioId = null;
+      return;
+    }
+
+    const dist = distanciaEuclidiana(npc.tileX, npc.tileY, alvo.tileX, alvo.tileY);
+
+    if (dist <= 1.4) {
+      // Chegou perto o bastante — dispara a fala (assíncrono, sem travar o tick) e entra em cooldown.
+      if (!npc.falandoAgora) {
+        npc.falandoAgora = true;
+        const funcionarioCatalogo = funcionariosIA.encontrarFuncionarioPorId(npc.id);
+        const promessaFala = funcionarioCatalogo
+          ? funcionariosIA.obterFalaAbordagem(funcionarioCatalogo)
+          : Promise.resolve('Olá! 👋 Dá uma olhada na loja!');
+
+        promessaFala.then((texto) => {
+          npc.falandoAgora = false;
+          difundirParaInstancia(cenarioId, instanciaId, 'funcionario_falou', { funcionario_id: npc.id, texto });
+        });
+      }
+      npc.estado = 'aguardando';
+      npc.alvoUsuarioId = null;
+      npc.cooldownAte = agora + COOLDOWN_MIN_MS + Math.random() * (COOLDOWN_MAX_MS - COOLDOWN_MIN_MS);
+      return;
+    }
+
+    if (dist > npc.raioAbordagem * 1.8) {
+      // A pessoa se afastou demais — desiste e volta a patrulhar.
+      npc.estado = 'patrulhando';
+      npc.alvoUsuarioId = null;
+      return;
+    }
+
+    const passo = escolherPassoEmDirecao(bloqueados, limites, npc.tileX, npc.tileY, alvo.tileX, alvo.tileY);
+    if (passo) {
+      npc.tileX = passo.x;
+      npc.tileY = passo.y;
+      npc.direcao = passo.direcao;
+    }
+    return;
+  }
+
+  // estado === 'patrulhando': primeiro checa se há algum visitante pra abordar por perto
+  let candidatoId = null;
+  let menorDist = Infinity;
+  salaJogadores.forEach((jog, usuarioId) => {
+    const dist = distanciaEuclidiana(npc.tileX, npc.tileY, jog.tileX, jog.tileY);
+    if (dist <= npc.raioAbordagem && dist < menorDist) {
+      menorDist = dist;
+      candidatoId = usuarioId;
+    }
+  });
+  if (candidatoId !== null) {
+    npc.estado = 'abordando';
+    npc.alvoUsuarioId = candidatoId;
+    return;
+  }
+
+  // Sem ninguém por perto: caminha até um ponto aleatório dentro do raio de patrulha do próprio stand.
+  if (npc.waypointX === null || (npc.tileX === npc.waypointX && npc.tileY === npc.waypointY)) {
+    if (Math.random() < 0.55) return; // pausa ocasional — não fica andando sem parar o tempo todo
+    const angulo = Math.random() * Math.PI * 2;
+    const raio = Math.random() * npc.raioPatrulha;
+    npc.waypointX = Math.round(npc.standCentroX + Math.cos(angulo) * raio);
+    npc.waypointY = Math.round(npc.standCentroY + Math.sin(angulo) * raio);
+  } else {
+    const passo = escolherPassoEmDirecao(bloqueados, limites, npc.tileX, npc.tileY, npc.waypointX, npc.waypointY);
+    if (passo) {
+      npc.tileX = passo.x;
+      npc.tileY = passo.y;
+      npc.direcao = passo.direcao;
+    } else {
+      npc.waypointX = null; // travou — escolhe outro destino no próximo tick
+    }
+  }
+}
+
+/** Roda um tick de IA pra todos os funcionários de todas as instâncias que têm gente dentro. */
+function tickTodosFuncionarios() {
+  funcionariosPorSala.forEach((porInstancia, cenarioId) => {
+    const bloqueados = funcionariosIA.construirColisao(cenarioId);
+    const limites = funcionariosIA.getCatalogo().cenarios.get(cenarioId) || { largura_grid: 9999, altura_grid: 9999 };
+
+    porInstancia.forEach((npcs, instanciaId) => {
+      const salaJogadores = salasPorCenario.get(cenarioId)?.get(instanciaId);
+      if (!salaJogadores || salaJogadores.size === 0) return; // ninguém pra abordar — não gasta ciclo de CPU à toa
+
+      npcs.forEach((npc) => {
+        const antes = { x: npc.tileX, y: npc.tileY, direcao: npc.direcao };
+        tickFuncionario(npc, cenarioId, instanciaId, bloqueados, limites, salaJogadores);
+        if (npc.tileX !== antes.x || npc.tileY !== antes.y || npc.direcao !== antes.direcao) {
+          difundirParaInstancia(cenarioId, instanciaId, 'funcionario_moved', {
+            funcionario_id: npc.id, tileX: npc.tileX, tileY: npc.tileY, direcao: npc.direcao,
+          });
+        }
+      });
+    });
+  });
+}
+
 // Cria um servidor HTTP "de verdade" (em vez de deixar a lib "ws" criar um
 // implícito) por dois motivos:
 //   1) Diagnóstico: dá pra abrir https://<seu-servico>.onrender.com/ no
@@ -171,10 +370,22 @@ const servidorHttp = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server: servidorHttp });
 
-servidorHttp.listen(WS_PORT, () => {
-  console.log(`[realtime-server] Servidor WebSocket da Feira Virtual escutando na porta ${WS_PORT}`);
-  console.log(`[realtime-server] Limite por instância: ${LIMITE_JOGADORES_POR_INSTANCIA} jogadores | Throttle de movimento: ${INTERVALO_MIN_BROADCAST_MOVE_MS}ms`);
-});
+// Espera o primeiro carregamento do catálogo de funcionários-IA ANTES de
+// abrir o servidor pra conexões — evita a corrida em que as primeiras
+// instâncias criadas logo no boot nasceriam sem nenhum funcionário (o
+// catálogo só seria buscado depois, e garantirFuncionariosDaInstancia só
+// roda uma vez, na criação da instância).
+(async () => {
+  await funcionariosIA.atualizarCatalogo();
+  funcionariosIA.iniciarAtualizacaoPeriodica();
+
+  servidorHttp.listen(WS_PORT, () => {
+    console.log(`[realtime-server] Servidor WebSocket da Feira Virtual escutando na porta ${WS_PORT}`);
+    console.log(`[realtime-server] Limite por instância: ${LIMITE_JOGADORES_POR_INSTANCIA} jogadores | Throttle de movimento: ${INTERVALO_MIN_BROADCAST_MOVE_MS}ms`);
+  });
+
+  setInterval(tickTodosFuncionarios, funcionariosIA.VELOCIDADE_TICK_MS);
+})();
 
 wss.on('connection', (ws) => {
   // Estado da conexão preenchido no "join"
@@ -237,6 +448,17 @@ wss.on('connection', (ws) => {
           }));
         enviar(ws, 'room_state', { jogadores: outros });
 
+        // 1.1) Envia também os funcionários-IA já ativos nesta instância (se houver)
+        const npcsDaInstancia = funcionariosPorSala.get(cenarioId)?.get(instanciaId);
+        if (npcsDaInstancia && npcsDaInstancia.size) {
+          enviar(ws, 'funcionarios_state', {
+            funcionarios: [...npcsDaInstancia.values()].map((n) => ({
+              funcionario_id: n.id, loja_id: n.lojaId, nome: n.nome, cor_loja: n.corLoja,
+              avatarConfig: n.avatarConfig, tileX: n.tileX, tileY: n.tileY, direcao: n.direcao,
+            })),
+          });
+        }
+
         // 2) Avisa os demais da instância que alguém entrou
         difundirParaInstancia(cenarioId, instanciaId, 'player_joined', {
           usuario_id: usuarioId, nome: payload.nome,
@@ -286,6 +508,27 @@ wss.on('connection', (ws) => {
         jogador.avatarConfig = msg.avatarConfig || jogador.avatarConfig;
         difundirParaInstancia(cenarioId, instanciaId, 'player_avatar_updated', {
           usuario_id: usuarioId, avatarConfig: jogador.avatarConfig,
+        }, usuarioId);
+        break;
+      }
+
+      case 'chat': {
+        // Mensagem de texto do "modo diálogo" — o servidor só retransmite
+        // pra sala, sem guardar histórico (é um balão de fala efêmero, não
+        // um chat persistente). O cliente decide se mostra o balão ou não
+        // com base na proximidade atual entre os dois jogadores.
+        const { usuarioId, cenarioId, instanciaId } = ws.contexto;
+        if (!usuarioId || !cenarioId) return;
+
+        const sala = salasPorCenario.get(cenarioId)?.get(instanciaId);
+        const jogador = sala?.get(usuarioId);
+        if (!jogador) return;
+
+        const texto = String(msg.texto || '').trim().slice(0, 200); // teto defensivo (cliente já limita a 80)
+        if (!texto) return;
+
+        difundirParaInstancia(cenarioId, instanciaId, 'chat_recebido', {
+          usuario_id: usuarioId, texto,
         }, usuarioId);
         break;
       }
